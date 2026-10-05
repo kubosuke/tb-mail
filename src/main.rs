@@ -1,10 +1,13 @@
+mod config;
 mod mbox;
 mod profile;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use mbox::{truncate, MboxIndex, ParsedBody};
-use profile::{list_accounts, default_account, mbox_path, thunderbird_root};
+use profile::{
+    account_for_email, default_account, list_accounts, mbox_path, thunderbird_root,
+};
 use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
@@ -19,13 +22,27 @@ struct Cli {
     #[arg(long, env = "TB_PROFILE", global = true)]
     profile: Option<PathBuf>,
 
-    /// IMAP account host folder under ImapMail/ (default: TB_ACCOUNT or first account)
+    /// Email address of the Thunderbird account (from prefs.js; env: TB_EMAIL). Takes precedence over --account.
+    #[arg(long, env = "TB_EMAIL", global = true)]
+    email: Option<String>,
+
+    /// IMAP account host folder under ImapMail/ (env: TB_ACCOUNT; default: first account)
     #[arg(long, env = "TB_ACCOUNT", global = true)]
     account: Option<String>,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Set or show the default account email (saved in ~/.config/tb-mail/config.toml)
+    Use {
+        /// Email to make the default (omit to show current default)
+        email: Option<String>,
+        /// Clear the saved default email
+        #[arg(long)]
+        clear: bool,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+        format: OutputFormat,
+    },
     /// List folders for each IMAP account
     Folders {
         #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
@@ -79,6 +96,11 @@ fn resolve_profile(cli: &Cli) -> Result<PathBuf> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Use {
+            ref email,
+            clear,
+            format,
+        } => cmd_use(&cli, email.as_deref(), clear, format),
         Command::Folders { format } => cmd_folders(&cli, format),
         Command::List {
             ref folder,
@@ -96,16 +118,116 @@ fn main() -> Result<()> {
     }
 }
 
+#[derive(Serialize)]
+struct UseResponse {
+    email: Option<String>,
+    account: Option<String>,
+    config: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    known: Option<Vec<String>>,
+}
+
+fn cmd_use(cli: &Cli, email: Option<&str>, clear: bool, format: OutputFormat) -> Result<()> {
+    if clear && email.is_some() {
+        anyhow::bail!("use either EMAIL or --clear, not both");
+    }
+
+    let profile = resolve_profile(cli)?;
+    let path = if clear {
+        config::clear_default_email()?
+    } else if let Some(email) = email {
+        // Validate against Thunderbird prefs before saving.
+        let account = account_for_email(&profile, email)?;
+        let path = config::set_default_email(email)?;
+        let resp = UseResponse {
+            email: Some(email.to_string()),
+            account: Some(account),
+            config: path.display().to_string(),
+            known: None,
+        };
+        return print_use(resp, format);
+    } else {
+        config::config_path()?
+    };
+
+    let saved = config::default_email();
+    let account = saved
+        .as_deref()
+        .and_then(|e| account_for_email(&profile, e).ok());
+    let known = list_accounts(&profile)?
+        .into_iter()
+        .filter_map(|a| a.email)
+        .collect::<Vec<_>>();
+
+    print_use(
+        UseResponse {
+            email: saved,
+            account,
+            config: path.display().to_string(),
+            known: Some(known),
+        },
+        format,
+    )
+}
+
+fn print_use(resp: UseResponse, format: OutputFormat) -> Result<()> {
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&resp)?),
+        OutputFormat::Text => match &resp.email {
+            Some(email) => {
+                if let Some(account) = &resp.account {
+                    println!("{email} ({account})");
+                } else {
+                    println!("{email}");
+                }
+            }
+            None => println!("(no default email; use: tb-mail use ADDRESS)"),
+        },
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct FolderAccount {
+    account: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    default: bool,
+    folders: Vec<String>,
+}
+
 fn cmd_folders(cli: &Cli, format: OutputFormat) -> Result<()> {
     let profile = resolve_profile(cli)?;
     let accounts = list_accounts(&profile)?;
+    let default_email = config::default_email();
+    let rows: Vec<FolderAccount> = accounts
+        .into_iter()
+        .map(|a| {
+            let is_default = match (&default_email, &a.email) {
+                (Some(d), Some(e)) => d.eq_ignore_ascii_case(e),
+                _ => false,
+            };
+            FolderAccount {
+                account: a.account,
+                email: a.email,
+                default: is_default,
+                folders: a.folders,
+            }
+        })
+        .collect();
+
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&accounts)?);
+            println!("{}", serde_json::to_string_pretty(&rows)?);
         }
         OutputFormat::Text => {
-            for a in &accounts {
-                println!("{}", a.account);
+            for a in &rows {
+                let mark = if a.default { "*" } else { " " };
+                match &a.email {
+                    Some(email) => println!("{mark} {} ({email})", a.account),
+                    None => println!("{mark} {}", a.account),
+                }
                 for f in &a.folders {
                     println!("  {f}");
                 }
@@ -119,6 +241,8 @@ fn cmd_folders(cli: &Cli, format: OutputFormat) -> Result<()> {
 struct ListResponse {
     profile: String,
     account: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
     folder: String,
     total: usize,
     messages: Vec<ListItem>,
@@ -136,7 +260,7 @@ struct ListItem {
 
 fn cmd_list(cli: &Cli, folder: &str, limit: usize, format: OutputFormat) -> Result<()> {
     let profile = resolve_profile(cli)?;
-    let account = resolve_account(cli, &profile)?;
+    let ResolvedAccount { account, email } = resolve_account(cli, &profile)?;
     let path = mbox_path(&profile, &account, folder);
     if !path.is_file() {
         anyhow::bail!("mbox not found: {}", path.display());
@@ -167,6 +291,7 @@ fn cmd_list(cli: &Cli, folder: &str, limit: usize, format: OutputFormat) -> Resu
             let resp = ListResponse {
                 profile: profile.display().to_string(),
                 account,
+                email,
                 folder: folder.to_string(),
                 total,
                 messages,
@@ -192,6 +317,8 @@ fn cmd_list(cli: &Cli, folder: &str, limit: usize, format: OutputFormat) -> Resu
 struct ReadResponse {
     profile: String,
     account: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
     folder: String,
     seq: usize,
     total: usize,
@@ -221,7 +348,7 @@ fn cmd_read(
     }
 
     let profile = resolve_profile(cli)?;
-    let account = resolve_account(cli, &profile)?;
+    let ResolvedAccount { account, email } = resolve_account(cli, &profile)?;
     let path = mbox_path(&profile, &account, folder);
     let index = MboxIndex::build(&path)?;
     let total = index.count();
@@ -245,6 +372,7 @@ fn cmd_read(
             let resp = ReadResponse {
                 profile: profile.display().to_string(),
                 account,
+                email,
                 folder: folder.to_string(),
                 seq,
                 total,
@@ -272,9 +400,44 @@ fn cmd_read(
     Ok(())
 }
 
-fn resolve_account(cli: &Cli, profile: &PathBuf) -> Result<String> {
-    if let Some(a) = &cli.account {
-        return Ok(a.clone());
+struct ResolvedAccount {
+    account: String,
+    email: Option<String>,
+}
+
+fn resolve_account(cli: &Cli, profile: &PathBuf) -> Result<ResolvedAccount> {
+    let accounts = list_accounts(profile)?;
+    let email_for = |account: &str| -> Option<String> {
+        accounts
+            .iter()
+            .find(|a| a.account == account)
+            .and_then(|a| a.email.clone())
+    };
+
+    // Precedence: --email / TB_EMAIL → --account / TB_ACCOUNT → saved `tb-mail use` → first account
+    if let Some(email) = &cli.email {
+        let account = account_for_email(profile, email)?;
+        return Ok(ResolvedAccount {
+            email: Some(email.clone()),
+            account,
+        });
     }
-    default_account(profile)
+    if let Some(a) = &cli.account {
+        return Ok(ResolvedAccount {
+            email: email_for(a),
+            account: a.clone(),
+        });
+    }
+    if let Some(email) = config::default_email() {
+        let account = account_for_email(profile, &email)?;
+        return Ok(ResolvedAccount {
+            email: Some(email),
+            account,
+        });
+    }
+    let account = default_account(profile)?;
+    Ok(ResolvedAccount {
+        email: email_for(&account),
+        account,
+    })
 }
